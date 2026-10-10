@@ -68,4 +68,56 @@ describe("regressão do incidente", () => {
     expect((await approve(app, "msn_1900", "2026-03-12T18:11:00.000Z", chave)).status).toBe(400);
     expect(await ledger(app, "msn_1900")).toHaveLength(0);
   });
+
+  it("duas chaves diferentes para a mesma missão creditam uma vez só", async () => {
+    expect((await approve(app, "msn_1900", "2026-03-12T18:11:00.000Z", "pay_a")).status).toBe(201);
+    expect((await approve(app, "msn_1900", "2026-03-12T18:11:00.000Z", "pay_b")).status).toBe(200);
+    expect(await ledger(app, "msn_1900")).toHaveLength(1);
+  });
+
+  it("aprovações concorrentes da mesma missão com chaves diferentes geram um crédito", async () => {
+    const results = await Promise.all(
+      ["c1", "c2", "c3", "c4", "c5"].map((k) => approve(app, "msn_1900", "2026-03-12T18:11:00.000Z", k)),
+    );
+    expect(results.filter((r) => r.status === 201)).toHaveLength(1);
+    expect(await ledger(app, "msn_1900")).toHaveLength(1);
+  });
+
+  it("retry de missão já creditada devolve o crédito mesmo depois do prazo", async () => {
+    await approve(app, "msn_1842", "2026-03-13T01:02:00.000Z", "pay_9f3");
+    expect((await approve(app, "msn_1842", "2026-03-14T12:00:00.000Z", "pay_9f3")).status).toBe(200);
+    expect(await ledger(app, "msn_1842")).toHaveLength(1);
+  });
+
+  it("chave já usada em outra missão é recusada sem creditar nenhuma das duas de novo", async () => {
+    await approve(app, "msn_1900", "2026-03-12T18:11:00.000Z", "pay_x");
+    expect((await approve(app, "msn_2044", "2026-03-20T15:00:00.000Z", "pay_x")).status).toBe(409);
+    expect(await ledger(app, "msn_1900")).toHaveLength(1);
+    expect(await ledger(app, "msn_2044")).toHaveLength(0);
+  });
+
+  it.each(["2026-03-12", "2026-03-13T00:30:00", "2026-03-13T00:30:00.000"])(
+    "approved_at sem fuso (%s) é recusado, porque o dia dependeria do servidor",
+    async (approvedAt) => {
+      expect((await approve(app, "msn_1842", approvedAt, "pay_tz")).status).toBe(400);
+    },
+  );
+
+  it("aceita approved_at com offset explícito de São Paulo", async () => {
+    expect((await approve(app, "msn_1842", "2026-03-12T23:59:59.999-03:00", "pay_off")).status).toBe(201);
+  });
+
+  it("PENDING ou FAILED atrasado do provedor não desfaz um repasse pago", async () => {
+    const res = await approve(app, "msn_2044", "2026-03-20T15:00:00.000Z", "pay_paid");
+    const { payout } = (await res.json()) as { payout: { id: string } };
+    const send = (provider_status: string) =>
+      app.request(`/payouts/${payout.id}/provider`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider_status }),
+      });
+    expect(((await (await send("CONFIRMED")).json()) as { status: string }).status).toBe("paid");
+    expect(((await (await send("PENDING")).json()) as { status: string }).status).toBe("paid");
+    expect(((await (await send("FAILED")).json()) as { status: string }).status).toBe("paid");
+  });
 });
