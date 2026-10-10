@@ -62,7 +62,8 @@ export function createApp(db: DatabaseSync) {
     if (!missionId || !approvedAt || !rawKey) {
       return c.json({ error: "missão, data de aprovação e chave são obrigatórias" }, 400);
     }
-    if (Number.isNaN(new Date(approvedAt).getTime())) {
+    // Sem fuso explícito o dia dependeria do relógio do servidor.
+    if (!/T\d{2}:\d{2}.*(Z|[+-]\d{2}:\d{2})$/.test(approvedAt) || Number.isNaN(new Date(approvedAt).getTime())) {
       return c.json({ error: "data de aprovação inválida" }, 400);
     }
 
@@ -86,6 +87,20 @@ export function createApp(db: DatabaseSync) {
       amount_cents: mission.amount_cents,
     });
 
+    // A aprovação paga a missão uma vez: um retry, com a mesma chave ou com outra,
+    // devolve o crédito que já existe, mesmo que chegue depois do prazo.
+    const key = normalizeKey(rawKey);
+    if (!key) return c.json({ error: "missão, data de aprovação e chave são obrigatórias" }, 400);
+    const sameKey = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
+    if (sameKey && sameKey.mission_id !== mission.id) {
+      return c.json({ error: "chave de idempotência já usada em outra missão" }, 409);
+    }
+    const existing = sameKey ?? one<Ledger>(db, "SELECT * FROM ledger WHERE mission_id = ?", mission.id);
+    if (existing) {
+      const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;
+      return c.json({ mission_id: mission.id, status: mission.status, ledger: existing, payout });
+    }
+
     if (isPastDeadline(approvedAt, mission.deadline_date)) {
       log({
         level: 40,
@@ -96,13 +111,6 @@ export function createApp(db: DatabaseSync) {
         deadline_date: mission.deadline_date,
       });
       return c.json({ error: "prazo encerrado" }, 409);
-    }
-
-    const key = normalizeKey(rawKey);
-    const existing = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
-    if (existing) {
-      const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;
-      return c.json({ mission_id: mission.id, status: mission.status, ledger: existing, payout });
     }
 
     const ledger: Ledger = {
@@ -158,13 +166,20 @@ export function createApp(db: DatabaseSync) {
       mission_id: payout.mission_id,
       provider_status: providerStatus,
     });
-    db.prepare("UPDATE payouts SET provider_status = ?, status = ? WHERE id = ?").run(
+    // Pago é estado final: um PENDING ou FAILED atrasado do provedor não desfaz o pagamento.
+    db.prepare("UPDATE payouts SET provider_status = ?, status = ? WHERE id = ? AND status <> 'paid'").run(
       providerStatus,
       status,
       payout.id,
     );
-    log({ level: 30, msg: "payout.status", payout_id: payout.id, status });
-    return c.json({ id: payout.id, mission_id: payout.mission_id, provider_status: providerStatus, status });
+    const current = one<Payout>(db, "SELECT * FROM payouts WHERE id = ?", payout.id) ?? payout;
+    log({ level: 30, msg: "payout.status", payout_id: current.id, status: current.status });
+    return c.json({
+      id: current.id,
+      mission_id: current.mission_id,
+      provider_status: current.provider_status,
+      status: current.status,
+    });
   });
 
   return app;
